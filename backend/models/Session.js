@@ -1,28 +1,25 @@
 // ═══════════════════════════════════════════════════════════════
-//  Ghost Business Verifier — Session Model  (FIXED)
+//  Ghost Business Verifier — Session Model
 //  models/Session.js
 // ═══════════════════════════════════════════════════════════════
 import mongoose from "mongoose";
 
 const AuditEntrySchema = new mongoose.Schema(
   {
-    action    : { type: String, required: true },
-    detail    : { type: String, default: "" },
-    timestamp : { type: Date, default: Date.now },
+    action   : { type: String, required: true },
+    detail   : { type: String, default: "" },
+    timestamp: { type: Date, default: Date.now },
   },
   { _id: false }
 );
 
 const SessionSchema = new mongoose.Schema(
   {
-    sessionId   : { type: String, required: true, unique: true, index: true },
-    businessId  : { type: String, required: true, index: true },
-    businessName: { type: String },
-
-    // ── Registered address (stored for display / audit) ──────────
+    sessionId        : { type: String, required: true, unique: true, index: true },
+    businessId       : { type: String, required: true, index: true },
+    businessName     : { type: String },
     registeredAddress: { type: String, default: "" },
 
-    // ── Status ────────────────────────────────────────────────────
     status: {
       type   : String,
       enum   : ["PENDING", "PASSED", "FLAGGED", "REVIEW", "ERROR"],
@@ -30,29 +27,38 @@ const SessionSchema = new mongoose.Schema(
       index  : true,
     },
 
-    // ── Scores (all top-level so $set works reliably) ─────────────
-    trustScore  : { type: Number, default: null },   // 0-100 integer
-    geoScore    : { type: Number, default: null },   // 0 or 1
-    signScore   : { type: Number, default: null },   // 0.0 – 1.0  ← WAS MISSING
-    infraScore  : { type: Number, default: null },   // 0.0 – 1.0  ← WAS MISSING
-
-    // ── GPS ───────────────────────────────────────────────────────
-    gpsDistanceMetres: { type: Number, default: null }, // ← WAS MISSING
+    // ── Scores ────────────────────────────────────────────────────
+    trustScore       : { type: Number, default: null },
+    geoScore         : { type: Number, default: null },
+    signScore        : { type: Number, default: null },
+    infraScore       : { type: Number, default: null },
+    gpsDistanceMetres: { type: Number, default: null },
 
     // ── S3 assets ─────────────────────────────────────────────────
-    s3VideoUri  : { type: String },
-    s3ThumbUri  : { type: String },
+    s3VideoUri: { type: String },
+    s3ThumbUri: { type: String },
 
-    // ── Raw AI results (kept for display) ────────────────────────
+    // ── AI results (raw + processed) ─────────────────────────────
     aiResults: {
       textDetected  : { type: String },
       labels        : [String],
-      infraScore    : { type: Number },   // mirror of top-level for legacy reads
-      livenessResult: { type: String },
-      isFlagged     : { type: Boolean },
+      infraScore    : { type: Number },
+
+      // Layer 1 — Liveness
+      livenessResult: { type: String, enum: ["LIVE", "SUSPICIOUS", "SPOOF_DETECTED", "NO_FACE", "UNKNOWN"], default: "UNKNOWN" },
+      livenessDetail: { type: String, default: "" },
+
+      // Layer 3 — Screen recording
+      screenRecording: {
+        detected  : { type: Boolean, default: false },
+        confidence: { type: String, enum: ["HIGH", "MEDIUM", "LOW", null], default: null },
+        reason    : { type: String, default: null },
+      },
+
+      isFlagged: { type: Boolean },
     },
 
-    // ── Device / GPS metadata ─────────────────────────────────────
+    // ── Device / GPS ──────────────────────────────────────────────
     meta: {
       device      : String,
       isRooted    : { type: Boolean, default: false },
@@ -62,16 +68,16 @@ const SessionSchema = new mongoose.Schema(
       accelerometer: [{ x: Number, y: Number, z: Number, t: Number }],
     },
 
-    // ── Manual review fields ──────────────────────────────────────
-    reviewNotes : { type: String },          // ← WAS MISSING
-    reviewedBy  : { type: String },          // ← WAS MISSING
-    reviewedAt  : { type: Date },            // ← WAS MISSING
+    // ── Manual review ─────────────────────────────────────────────
+    reviewNotes: { type: String },
+    reviewedBy : { type: String },
+    reviewedAt : { type: Date },
 
     // ── Audit trail ───────────────────────────────────────────────
-    auditLog: { type: [AuditEntrySchema], default: [] }, // ← WAS MISSING
+    auditLog: { type: [AuditEntrySchema], default: [] },
   },
   {
-    timestamps: true,   // ← WAS MISSING — adds createdAt / updatedAt
+    timestamps: true, // adds createdAt + updatedAt
   }
 );
 

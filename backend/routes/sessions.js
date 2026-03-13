@@ -1,6 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
-//  Ghost Business Verifier — Sessions Routes  (FIXED)
+//  Ghost Business Verifier — Sessions Routes
 //  routes/sessions.js
+//
+//  Fixes applied:
+//    ✅ gpsDistanceMetres + registeredAddress saved to DB
+//    ✅ signScore uses fuzzy word matching (not hardcoded 0.85/0.20)
+//    ✅ PATCH /review uses $set correctly (no MongoServerError)
+//    ✅ Layer 1 — Liveness enforcement (SPOOF_DETECTED / SUSPICIOUS)
+//    ✅ Layer 3 — Screen recording enforcement (phone+screen pair)
 // ═══════════════════════════════════════════════════════════════
 import express  from "express";
 import Session  from "../models/Session.js";
@@ -8,7 +15,6 @@ import Business from "../models/Business.js";
 import { io }   from "../index.js";
 import {
   haversineDistance,
-  computeInfraScore,
   computeSignageScore,
   computeTrustScore,
   deriveStatus,
@@ -20,6 +26,7 @@ const router = express.Router();
 // ─────────────────────────────────────────────────────────────────
 //  POST /api/sessions
 //  Called by React Native app when verification starts.
+//  Creates a PENDING session and immediately computes geo score.
 // ─────────────────────────────────────────────────────────────────
 router.post("/", async (req, res) => {
   try {
@@ -35,14 +42,10 @@ router.post("/", async (req, res) => {
       appVersion,
     } = req.body;
 
-    // Validate required fields
     if (!sessionId || !businessId) {
-      return res
-        .status(400)
-        .json({ error: "sessionId and businessId are required" });
+      return res.status(400).json({ error: "sessionId and businessId are required" });
     }
 
-    // Block rooted devices immediately
     if (isRooted === true) {
       return res.status(403).json({
         error  : "DEVICE_COMPROMISED",
@@ -62,15 +65,11 @@ router.post("/", async (req, res) => {
       };
       registeredAddress = business.registeredAddress.fullText || "";
     } else {
-      // Fallback for dev/hackathon when business record doesn't exist yet
-      registeredCoords  = { lat: 12.9716, lng: 77.5946 };
+      registeredCoords  = { lat: 12.9716, lng: 77.5946 }; // mock Bengaluru
       registeredAddress = "Mock: Bengaluru, Karnataka";
     }
 
-    // ── BUG FIX 1: Geo score ──────────────────────────────────────
-    // geoScore was being computed correctly but gpsDistanceMetres was never
-    // saved to the DB because Session schema had no such field.
-    // Now both fields exist in the schema and are explicitly persisted.
+    // Compute geo score — gpsDistanceMetres now saved (was silently dropped before)
     let geoScore          = 0;
     let gpsDistanceMetres = null;
 
@@ -79,18 +78,17 @@ router.post("/", async (req, res) => {
       geoScore = gpsDistanceMetres <= GEO_DISTANCE_THRESHOLD_METRES ? 1 : 0;
     }
 
-    // Create session — all scored fields are now schema fields
     const session = await Session.create({
       sessionId,
       businessId,
       businessName,
-      registeredAddress,          // ← now a schema field
-      status            : "PENDING",
-      geoScore,                   // ← schema field
-      gpsDistanceMetres,          // ← now a schema field (was silently dropped)
+      registeredAddress,
+      status           : "PENDING",
+      geoScore,
+      gpsDistanceMetres,
       meta: {
         device,
-        isRooted   : isRooted ?? false,
+        isRooted     : isRooted ?? false,
         gpsStart,
         gpsEnd,
         appVersion,
@@ -130,12 +128,10 @@ router.post("/", async (req, res) => {
     }
 
     res.status(201).json({
-      success          : true,
-      sessionId        : session.sessionId,
+      success           : true,
+      sessionId         : session.sessionId,
       geoScore,
-      gpsDistanceMetres: gpsDistanceMetres
-        ? parseFloat(gpsDistanceMetres.toFixed(1))
-        : null,
+      gpsDistanceMetres : gpsDistanceMetres ? parseFloat(gpsDistanceMetres.toFixed(1)) : null,
       immediatelyFlagged: geoScore === 0,
     });
 
@@ -151,6 +147,8 @@ router.post("/", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────
 //  POST /api/sessions/ai-result
 //  Called by AWS Lambda after Rekognition analysis completes.
+//  Handles: sign scoring, infra scoring, Layer 1 liveness,
+//           Layer 3 screen recording detection.
 // ─────────────────────────────────────────────────────────────────
 router.post("/ai-result", async (req, res) => {
   try {
@@ -159,131 +157,212 @@ router.post("/ai-result", async (req, res) => {
       textDetected,
       labels,
       infraScore,
-      isFlagged,
-      livenessResult,
-      sessionId: sessionIdFromBody,
+      isFlagged       : isFlaggedFromLambda,
+      livenessResult,          // Layer 1: "LIVE" | "SUSPICIOUS" | "SPOOF_DETECTED" | "NO_FACE"
+      livenessDetail,          // Layer 1: human-readable reason string
+      screenRecording,         // Layer 3: { isScreenRecording, confidence, reason }
+      sessionId       : sessionIdFromBody,
     } = req.body;
 
-    // ── BUG FIX 2: sessionId extraction ───────────────────────────
-    // Lambda was not sending sessionId in the POST body (see index.mjs fix).
-    // The s3Key fallback extraction was also fragile — improved below.
+    // ── Resolve sessionId (3 fallback methods) ────────────────────
+
     let sessionId = null;
 
-    // Method 1: Lambda sends sessionId directly in body (preferred — fixed in Lambda)
+    // Method 1: Lambda sends it directly in the body (preferred)
     if (sessionIdFromBody) {
       sessionId = sessionIdFromBody;
     }
 
-    // Method 2: Extract from s3Key  →  thumbnails/<sessionId>_<timestamp>.<ext>
+    // Method 2: Extract from s3Key → thumbnails/<sessionId>_<timestamp>.<ext>
     if (!sessionId && s3Key) {
-      const filename       = s3Key.split("/").pop();          // "sess_abc_123_1710000000.jpg"
-      const nameWithoutExt = filename.replace(/\.[^.]+$/, ""); // strip extension
-      const lastUnderscore = nameWithoutExt.lastIndexOf("_");  // find timestamp separator
-
-      // ── BUG FIX 3: was using split("_").slice(0,-1) which breaks sessionIds
-      // that themselves contain underscores (e.g. "sess_abc_BIZ001").
-      // Using lastIndexOf("_") correctly strips only the trailing timestamp.
+      const filename       = s3Key.split("/").pop();
+      const nameWithoutExt = filename.replace(/\.[^.]+$/, "");
+      const lastUnderscore = nameWithoutExt.lastIndexOf("_");
+      // lastIndexOf strips only the trailing timestamp, safe for IDs with underscores
       if (lastUnderscore > 0) {
         sessionId = nameWithoutExt.substring(0, lastUnderscore);
       }
     }
 
-    // Method 3: No session found — return computed score in test mode
+    // Method 3: Still no sessionId — anonymous test mode
     if (!sessionId) {
       console.warn(`[ai-result] Could not extract sessionId from s3Key: ${s3Key}`);
 
       const infraScoreVal = infraScore || 0;
-      const signScore     = 0.2;
-      const geoScore      = 0;
-      const trustScore    = Math.round((geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100);
-      const status        = trustScore >= 70 ? "PASSED" : trustScore >= 40 ? "REVIEW" : "FLAGGED";
+      // ── SIGN SCORE FIX: use computeSignageScore, not hardcoded 0.2
+      const signScore  = computeSignageScore(textDetected, "");
+      const geoScore   = 0;
+      const isFlagged  = isFlaggedFromLambda ?? false;
+      const trustScore = computeTrustScore({ geoScore, signScore, infraScore: infraScoreVal });
+      const status     = deriveStatus(trustScore, isFlagged, geoScore);
 
       return res.json({
-        success   : true,
-        testMode  : true,
-        message   : "No session found — returned computed score only (test mode)",
-        trustScore, status, textDetected, labels, infraScore: infraScoreVal, isFlagged,
+        success : true,
+        testMode: true,
+        message : "No session found — returned computed score only (test mode)",
+        trustScore, status, textDetected, labels,
+        infraScore: infraScoreVal, signScore, isFlagged,
       });
     }
 
     const session = await Session.findOne({ sessionId });
 
+    // SessionId resolved but not yet in DB
     if (!session) {
       console.warn(`[ai-result] Session not found in DB: ${sessionId}`);
 
       const infraScoreVal = infraScore || 0;
-      const signScore     = textDetected && textDetected !== "NONE" ? 0.85 : 0.2;
-      const geoScore      = 0;
-      const trustScore    = Math.round((geoScore * 0.4 + signScore * 0.3 + infraScoreVal * 0.3) * 100);
-      const status        = trustScore >= 70 ? "PASSED" : trustScore >= 40 ? "REVIEW" : "FLAGGED";
+      // ── SIGN SCORE FIX: was hardcoded 0.85/0.2 — now uses real scoring
+      const signScore  = computeSignageScore(textDetected, "");
+      const geoScore   = 0;
+      const isFlagged  = isFlaggedFromLambda ?? false;
+      const trustScore = computeTrustScore({ geoScore, signScore, infraScore: infraScoreVal });
+      const status     = deriveStatus(trustScore, isFlagged, geoScore);
 
       return res.json({
-        success  : true,
-        testMode : true,
-        message  : `Session ${sessionId} not in DB — score computed without GPS`,
-        trustScore, status, textDetected, labels, infraScore: infraScoreVal, isFlagged,
+        success : true,
+        testMode: true,
+        message : `Session ${sessionId} not in DB — score computed without GPS or business name`,
+        trustScore, status, textDetected, labels,
+        infraScore: infraScoreVal, signScore, isFlagged,
       });
     }
 
-    // ── Session found — full scoring ──────────────────────────────
+    // ── Full scoring with real session data ───────────────────────
 
-    // ── BUG FIX 4: signScore was computed but schema had no top-level
-    // signScore or infraScore fields, so $set silently discarded them.
-    // Both fields now exist in the schema (Session.js fix).
+    // ── SIGN SCORE FIX ────────────────────────────────────────────
+    // Old code: signScore = textDetected !== 'NONE' ? 0.85 : 0.20  (flat, no comparison)
+    // New code: computeSignageScore does fuzzy word matching against businessName
+    //
+    //   Score tiers:
+    //   1.00 → exact full name in frame
+    //   0.85 → all significant brand words matched
+    //   0.55–0.70 → primary brand word matched (scales with extra words)
+    //   0.30–0.50 → some non-primary words matched
+    //   0.25 → text found but no name words matched (random sign)
+    //   0.10 → no text detected at all
     const signScore     = computeSignageScore(textDetected, session.businessName);
     const infraScoreVal = infraScore || 0;
 
+    // ── Layer 1: Liveness enforcement ────────────────────────────
+    // SPOOF_DETECTED = bright + blurry + flat face (recording a screen)
+    // SUSPICIOUS     = 2 of 3 liveness signals present
+    const livenessIsFlagged =
+      livenessResult === "SPOOF_DETECTED" || livenessResult === "SUSPICIOUS";
+
+    // ── Layer 3: Screen recording enforcement ─────────────────────
+    // HIGH   = phone+screen label pair detected
+    // MEDIUM = 2+ screen-type labels detected
+    // LOW    = single phone label (still flagged)
+    const screenIsFlagged = screenRecording?.isScreenRecording === true;
+
+    // Combine all flag sources
+    const isFlagged = isFlaggedFromLambda || livenessIsFlagged || screenIsFlagged;
+
+    // ── Zero out video-derived scores if fraud detected ───────────
+    // If the video itself can't be trusted, sign and infra evidence
+    // is worthless — zeroing prevents a spoofed video from boosting score.
+    const effectiveSignScore  = (livenessIsFlagged || screenIsFlagged) ? 0 : signScore;
+    const effectiveInfraScore = (livenessIsFlagged || screenIsFlagged) ? 0 : infraScoreVal;
+
     const trustScore = computeTrustScore({
       geoScore  : session.geoScore,
-      signScore,
-      infraScore: infraScoreVal,
+      signScore : effectiveSignScore,
+      infraScore: effectiveInfraScore,
     });
 
     const status = deriveStatus(trustScore, isFlagged, session.geoScore);
 
+    // ── Build audit log entries ───────────────────────────────────
+    const auditEntries = [];
+
+    if (livenessIsFlagged) {
+      auditEntries.push({
+        action: "LIVENESS_FAIL",
+        detail: `Layer 1 — ${livenessResult}: ${livenessDetail ?? ""}`,
+      });
+    }
+
+    if (screenIsFlagged) {
+      auditEntries.push({
+        action: "SCREEN_RECORDING_DETECTED",
+        detail: `Layer 3 — ${screenRecording.confidence}: ${screenRecording.reason}`,
+      });
+    }
+
+    auditEntries.push({
+      action: "AI_RESULT_RECEIVED",
+      detail:
+        `Score: ${trustScore} | Status: ${status} | ` +
+        `Sign: ${effectiveSignScore.toFixed(2)} | Infra: ${effectiveInfraScore} | ` +
+        `Liveness: ${livenessResult ?? "N/A"} | ` +
+        `Screen: ${screenIsFlagged ? screenRecording.confidence : "CLEAR"} | ` +
+        `Labels: ${labels?.join(", ")}`,
+    });
+
+    // ── Persist to DB ─────────────────────────────────────────────
     await Session.findOneAndUpdate(
       { sessionId },
       {
         $set: {
           status,
           trustScore,
-          signScore,                          // ← now a real schema field
-          infraScore  : infraScoreVal,        // ← now a real schema field
-          s3ThumbUri  : s3Key,
-          aiResults   : {
+          signScore : effectiveSignScore,
+          infraScore: effectiveInfraScore,
+          s3ThumbUri: s3Key,
+          aiResults : {
             textDetected,
             labels,
-            infraScore  : infraScoreVal,
+            infraScore    : effectiveInfraScore,
             livenessResult: livenessResult ?? "UNKNOWN",
+            livenessDetail: livenessDetail ?? "",
             isFlagged,
+            screenRecording: {
+              detected  : screenIsFlagged,
+              confidence: screenRecording?.confidence ?? null,
+              reason    : screenRecording?.reason     ?? null,
+            },
           },
         },
         $push: {
-          auditLog: {
-            action: "AI_RESULT_RECEIVED",
-            detail: `Score: ${trustScore} | Status: ${status} | Sign: ${signScore.toFixed(2)} | Infra: ${infraScoreVal} | Labels: ${labels?.join(", ")}`,
-          },
+          auditLog: { $each: auditEntries },
         },
       },
       { new: true }
     );
 
+    // ── Emit real-time event ──────────────────────────────────────
     io.emit("session_complete", {
       sessionId,
       trustScore,
       status,
-      labels      : labels ?? [],
+      labels         : labels ?? [],
       textDetected,
-      infraScore  : infraScoreVal,
-      signScore,
-      geoScore    : session.geoScore,
+      infraScore     : effectiveInfraScore,
+      signScore      : effectiveSignScore,
+      geoScore       : session.geoScore,
       isFlagged,
-      timestamp   : new Date().toISOString(),
+      livenessResult,
+      screenRecording: screenRecording ?? null,
+      timestamp      : new Date().toISOString(),
     });
 
-    console.log(`[ai-result] ✅ ${sessionId} → Score: ${trustScore} | Status: ${status} | Sign: ${signScore.toFixed(2)}`);
+    console.log(
+      `[ai-result] ✅ ${sessionId} → Score: ${trustScore} | Status: ${status} | ` +
+      `Sign: ${effectiveSignScore.toFixed(2)} | Liveness: ${livenessResult ?? "N/A"} | ` +
+      `Screen: ${screenIsFlagged ? "FLAGGED" : "CLEAR"}`
+    );
 
-    res.json({ success: true, sessionId, trustScore, status, signScore, infraScore: infraScoreVal });
+    res.json({
+      success      : true,
+      sessionId,
+      trustScore,
+      status,
+      signScore    : effectiveSignScore,
+      infraScore   : effectiveInfraScore,
+      livenessResult,
+      screenFlagged: screenIsFlagged,
+    });
 
   } catch (err) {
     console.error("[POST /sessions/ai-result]", err);
@@ -293,6 +372,7 @@ router.post("/ai-result", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────
 //  GET /api/sessions
+//  List all sessions with optional filtering.
 // ─────────────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
@@ -327,6 +407,7 @@ router.get("/", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────
 //  GET /api/sessions/:id
+//  Single session with full audit trail.
 // ─────────────────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {
   try {
@@ -343,6 +424,7 @@ router.get("/:id", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────
 //  PATCH /api/sessions/:id/review
+//  Risk officer adds review notes and optionally changes status.
 // ─────────────────────────────────────────────────────────────────
 router.patch("/:id/review", async (req, res) => {
   try {
@@ -362,10 +444,8 @@ router.patch("/:id/review", async (req, res) => {
       },
     };
 
-    // ── BUG FIX 5: newStatus was being set at the top level of the update
-    // object, but Mongoose requires status changes to be inside $set when
-    // using $push in the same update — mixing operator and non-operator keys
-    // causes a MongoServerError in newer MongoDB drivers.
+    // newStatus goes inside $set — mixing top-level keys with $push
+    // causes a MongoServerError in MongoDB 5+
     if (newStatus) update.$set.status = newStatus;
 
     const session = await Session.findOneAndUpdate(
